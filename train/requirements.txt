@@ -1,0 +1,7 @@
+# Install on the CUDA training box (NOT the dev laptop). Python 3.10-3.12.
+torch>=2.2
+transformers>=4.44
+datasets>=2.19
+peft>=0.11
+bitsandbytes>=0.43   # 4-bit QLoRA; needs CUDA. Omit + use --no_4bit on CPU-less paths.
+accelerate>=0.30

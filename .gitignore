@@ -1,0 +1,38 @@
+# ── Model weights (huge, never commit) ─────────────────────────
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+adapter/
+train/**/checkpoint*/
+
+# ── Generated outputs / runs / logs ────────────────────────────
+runtime/
+kaggle_out/
+kaggle_out_v11/
+kaggle_out_v11_log/
+kaggle_out_v12/
+dk_out/
+dk_log/
+ds_upload/
+ds_v11/
+*.log
+
+# ── Datasets (regenerable / large) ─────────────────────────────
+data/*.jsonl
+data_kernel/*.jsonl
+
+# ── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ── OS / editor ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
