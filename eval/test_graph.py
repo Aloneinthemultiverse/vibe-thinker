@@ -151,6 +151,37 @@ def test_retrieve_content_clean():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_recall_history_clean():
+    """recall_history returns relevant, concise prior chatter — not a raw dump, no labels."""
+    g, tmp = _g()
+    try:
+        g.add_node("result", "actor", "initials returned lowercase 'al' not 'AL'")
+        g.add_node("directive", "reasoner", "apply upper() over each initial letter")
+        for i in range(4):
+            g.add_node("result", "actor", f"unrelated reverse-list step {i} ok")
+        h = g.recall_history("initials uppercase AL", k=2, max_chars=600)
+        assert "initials" in h.lower()
+        assert "[directive" not in h and "[result" not in h   # no heavy labels
+        assert len(h) <= 600
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ingest_text_chunks_to_facts():
+    """ingest_text adds chunked source-tier fact nodes that are then retrievable as content."""
+    from agent.ingest import ingest_text, _chunk
+    g, tmp = _g()
+    try:
+        doc = "Spec: the clamp(x) function must bound x into [0, 100] inclusive.\n" * 60
+        ids = ingest_text(g, doc, source="spec.md")
+        assert len(ids) >= 2                      # long doc -> multiple chunks
+        assert all(g.get(i)["kind"] == "fact" for i in ids)
+        content = g.retrieve_content("clamp bound 0 100", k=2)
+        assert "clamp" in content and "[" not in content.split("clamp")[0][-3:]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

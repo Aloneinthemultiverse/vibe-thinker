@@ -206,6 +206,28 @@ class Graph:
                 break
         return "\n\n".join(out)
 
+    def recall_history(self, query, k=3, max_chars=600):
+        """History via RETRIEVAL done right: return only the top-k RELEVANT prior chatter
+        (insights/results/corrections) for `query`, concise and deduped — NOT a raw dump of
+        every recent node (that confused the 3B). One short line per item, no heavy labels."""
+        hits = self.search(query, k=k * 2,
+                           kinds=("directive", "correction", "result", "plan", "query"))
+        seen, lines, used = set(), [], 0
+        for h in hits:
+            t = " ".join(h["text"].split())[:140]
+            if t in seen:
+                continue
+            seen.add(t)
+            tag = "tried" if h["kind"] in ("directive", "correction") else "saw"
+            line = f"- {tag}: {t}"
+            if used + len(line) > max_chars:
+                break
+            lines.append(line)
+            used += len(line)
+            if len(lines) >= k:
+                break
+        return "\n".join(lines)
+
     def think(self, query, k=5):
         """gbrain `think`: synthesize a short answer from the top hits + a GAP note
         on what the graph does not yet contain. Not raw nodes — a digest."""
