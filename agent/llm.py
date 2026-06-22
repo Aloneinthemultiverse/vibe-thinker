@@ -6,6 +6,12 @@ import urllib.error
 
 ENDPOINT = "http://127.0.0.1:8080/v1/chat/completions"
 
+# Dual-brain Reasoner: the un-fine-tuned BASE VibeThinker-3B served in chat mode on its
+# own port (long chain-of-thought; v12 on :8080 is the Actor). Env-overridable so a single
+# shared server can be reused if needed.
+REASONER_ENDPOINT = os.environ.get(
+    "REASONER_ENDPOINT", "http://127.0.0.1:8082/v1/chat/completions")
+
 # Escalation target: a BIGGER model used only when the 3B is stuck. Pluggable via
 # env so the harness stays zero-config — if unset, the loop falls back to best-of-N
 # on the local model (see loop.escalate). OpenAI-compatible endpoint + optional key.
@@ -73,9 +79,35 @@ def chat_big(messages, temperature=0.2, max_tokens=2048):
     return _post(BIG_ENDPOINT, json.dumps(payload).encode("utf-8"), headers, timeout=300)
 
 
-def healthy():
+def chat_reasoner(messages, temperature=0.6, top_p=0.95, max_tokens=4096):
+    """Call the BASE-model Reasoner (long CoT). Higher default max_tokens than the Actor
+    because we WANT long reasoning here — the base model's strength v12 lost. Same 400
+    trim-and-retry recovery as chat()."""
+    hdr = {"Content-Type": "application/json"}
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2) as r:
+        return _post(REASONER_ENDPOINT, _body(messages, temperature, top_p, max_tokens),
+                     hdr, timeout=300)
+    except urllib.error.HTTPError as e:
+        if e.code == 400 and len(messages) > 10:
+            trimmed = _trim(messages)
+            return _post(REASONER_ENDPOINT, _body(trimmed, temperature, top_p, max_tokens),
+                         hdr, timeout=300)
+        raise
+
+
+def _health(base_url, timeout=2):
+    try:
+        with urllib.request.urlopen(base_url + "/health", timeout=timeout) as r:
             return r.status == 200
     except Exception:
         return False
+
+
+def healthy():
+    return _health("http://127.0.0.1:8080")
+
+
+def reasoner_healthy():
+    """True if the Reasoner server is up (derive base URL from REASONER_ENDPOINT)."""
+    base = REASONER_ENDPOINT.split("/v1/")[0]
+    return _health(base)
