@@ -65,8 +65,12 @@ python -m eval.ablation         --heldout     # full harness
 | v12, single-shot | 50% |
 | **v12 + harness** | **100%** |
 | v12 + harness, hard multi-bug | 83% |
+| **dual-brain, hard multi-bug** | **100% (6/6, all via coupling)** |
 
-The harness roughly **doubles** the raw model. That's the whole thesis.
+The harness roughly **doubles** the raw model. That's the whole thesis. The dual-brain
+(base Reasoner + v12 Actor coupled via a shared graph) then beats the single-brain harness
+on hard compound bugs (83% → 100%), all local, no fine-tuning. See
+[docs/dual-brain-design.md](docs/dual-brain-design.md).
 
 ## License
 
