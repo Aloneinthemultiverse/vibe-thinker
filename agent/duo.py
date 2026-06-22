@@ -42,11 +42,16 @@ def _hint(test_output):
 
 
 # ----------------------------------------------------------------- Reasoner (base 3B)
-def _reason(task, current_src, failing):
+def _reason(task, current_src, failing, history=""):
     """Reasoner THINKS: produce CoT diagnosing the bug(s) and stating the exact fix.
-    Allowed to ramble — the Actor distills it. Returns (cot_text, short_insight)."""
+    Allowed to ramble — the Actor distills it. Returns (cot_text, short_insight).
+
+    `history` (opt-in) = CLEAN concise prior attempts from graph.recall_history — NOT the raw
+    chatter dump that confused the 3B. Code is always delivered via the pipeline (current_src)."""
     hint = _hint(failing)
     usr = (f"{task}\n\nCurrent file:\n```python\n{current_src}```\n")
+    if history:
+        usr += f"\nPrior attempts (brief, don't repeat them):\n{history}\n"
     if failing:
         usr += f"\nThe tests still FAIL. Latest output:\n{failing[:700]}\n"
     if hint:
@@ -139,7 +144,11 @@ def solve(task, store_dir=None, verbose=True):
 
     for rnd in range(1, MAX_ROUNDS + 1):
         say(f"\n=== duo round {rnd}/{MAX_ROUNDS} ===")
-        cot, insight = _reason(task, src, failing)
+        # opt-in clean history recall (gbrain-style, concise) — code still via pipeline
+        history = ""
+        if os.environ.get("DUO_HISTORY") and rnd > 1:
+            history = g.recall_history(_hint(failing) + " " + task, k=3)
+        cot, insight = _reason(task, src, failing, history=history)
         g.add_node("directive", "reasoner", insight)
         say(f"  [reasoner] {len(cot)} chars | {insight[:90]}")
 
