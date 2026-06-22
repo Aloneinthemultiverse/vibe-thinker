@@ -15,7 +15,10 @@ import time
 os.environ["EPISODIC_OFF"] = "1"   # honesty: no answer-key recall (§9.6 posture)
 
 from agent import llm, tools
-from agent.duo import solve
+if "--v2" in sys.argv:
+    from agent.duo2 import solve   # graph-driven multi-step tool agent
+else:
+    from agent.duo import solve    # proven transcribe coupling (baseline)
 
 TWO_BUGS = {
     "buggy": (
