@@ -294,3 +294,64 @@ stays the only source of truth, so a bad skill is at worst ignorable noise on th
 **Discipline (same as what got us to 100%):** add skills **one at a time, each behind its
 own eval.** The weak 3B mis-calls tools under load; don't bolt on five at once. Each new
 tool = more surface area the Actor can get wrong, so prove it pays before adding the next.
+
+---
+
+## 9. Open issues → concrete solutions (resolve in build)
+
+Each issue below has a chosen, effective fix. These are the build contract for `duo.py`.
+
+### 9.1 Turn-order / deadlock (blocking query stalls the loop)
+**Fix — single-threaded scheduler with a fixed priority, no waiting.** `duo.py` owns the only
+loop; the brains never block on each other. Each tick the scheduler picks the next actor by
+priority on the shared graph's tail:
+```
+open query?      → Reasoner answers it      (priority 1)
+fresh result?    → Reasoner monitors        (priority 2)
+have directive?  → Actor executes next step (priority 3)
+none of the above→ Reasoner does global/local think
+```
+Because it's one process draining a queue, "blocking" just means *"this node must be consumed
+before any Actor step"* — a sort key, not a thread wait. Deadlock is structurally impossible.
+
+### 9.2 Reasoner names a non-existent tool
+**Fix — validate every plan step against the live tool registry; coerce or drop.** `tools.py`
+already has the registry; expose `TOOLS = {name: fn}`. When a `directive`/`correction` lands,
+`duo.py` filters `plan` to known tools, fuzzy-maps near-misses (`"read"→"read_file"`), and if a
+step can't resolve, drops it and appends a `fact` node *"unknown tool X ignored"* so the
+Reasoner learns. The Actor only ever receives a validated plan. Zero LLM cost — pure dict lookup.
+
+### 9.3 Query / chatter loop (no test ever runs)
+**Fix — per-subgoal query budget + forced action.** Counter `queries[subgoal]`; cap = 2. On the
+3rd query the scheduler injects a directive *"insufficient info — make your best attempt and run
+tests"* and forces an Actor step. The verifier then produces real signal, which is always more
+useful than more talk. Pairs with the existing `MAX_CORRECTIONS`/`MAX_ROUNDS` caps.
+
+### 9.4 Node-ID collisions (content-hash overwrite)
+**Fix — composite deterministic ID, still no Date/random.** `id = sha1(f"{author}|{kind}|{seq}|{text}")[:16]`
+where `seq` is a per-graph monotonic counter persisted in `meta.json` and incremented on every
+`add_node`. Identical text at different times → different `seq` → different id. Deterministic
+(resume-safe), collision-free, no clock/RNG.
+
+### 9.5 Context windowing (graph feed blows up — the v12 context-bloat trap)
+**Fix — bounded, role-shaped context budget per brain.** Never feed the whole graph. Each
+prompt gets: **task + current subgoal + last K=3 nodes on the tail + top-M=4 `search()` hits**
+for the query, hard-capped at `CTX_CHARS` (e.g. 2500). Actor leans recent (what just failed);
+Reasoner leans retrieved (relevant past insight). This is the same lean-context discipline that
+fixed v12 — applied to the bus, not the prompt.
+
+### 9.6 Eval honesty for duo
+**Fix — `DUO_EVAL` guard that hard-empties the answer channel.** `run_duo.py` sets a flag that
+(a) skips loading any persisted `graphs/*` store, (b) seeds only *analogous* facts (never the
+held-out solutions), (c) asserts at startup that no node text contains an eval problem's answer
+string. Same posture as `EPISODIC_OFF`; makes memorization-via-retrieval impossible, not just
+discouraged.
+
+### 9.7 Reasoner server unverified (`:8082` may not reason long)
+**Fix — Phase-C gate before any loop wiring.** A smoke test (`eval/smoke_reasoner.py`) sends a
+known hard prompt to `:8082` and asserts the reply is genuinely long-form CoT (e.g. > 800 chars,
+contains step markers) — proving the *base* GGUF is loaded, not v12. If it fails, the build
+stops at Phase C. The duo loop is never wired to an unverified reasoner.
+
+**Build order impact:** 9.4/9.5 land in Phase B (graph module), 9.7 in Phase C, 9.1/9.2/9.3 in
+Phase D (orchestrator), 9.6 in Phase E (benchmark). None change the architecture — they harden it.
