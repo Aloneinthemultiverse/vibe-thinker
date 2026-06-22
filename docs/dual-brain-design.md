@@ -252,6 +252,13 @@ result**, so it is monitoring continuously, not just at the start.
 dual-brain coupling, with no external/bigger model. That is the proof the architecture earns
 its complexity.
 
+> **RESULT (2026-06-23): MET.** `eval/run_duo.py` solved the two-bug `initials` task in
+> 2 rounds / 238s, `via=coupling`, no bigger model. Winning design (not the original rigid
+> directives — the base model echoes those): the Reasoner THINKS in free-form CoT and the
+> Actor (v12) TRANSCRIBES the reasoning into one clean file; retry-with-hint feeds the failing
+> assertion back between rounds. Requires the Reasoner on GPU (`-ngl 99`, fits alongside v12
+> in 8GB Arc) — on CPU the loop is too slow/flaky and degrades to single-brain.
+
 ---
 
 ## 7. Risks & honest notes
