@@ -25,6 +25,13 @@ from .vecindex import VecIndex, _tok, rrf, default_embedder
 KINDS = ("plan", "directive", "correction", "query", "action", "result", "fact", "symbol")
 EDGE_TYPES = ("led_to", "refuted", "supports", "about", "calls")
 
+# gbrain-style SOURCE TIERS: authoritative content (code, docs, symbols) outranks
+# transient session chatter (directives/results/actions) in retrieval, so chatter never
+# crowds out the real code (the duo2 bug). Higher = more authoritative.
+TIER = {"fact": 1.6, "symbol": 1.6, "plan": 1.1, "directive": 0.8, "correction": 0.8,
+        "query": 0.7, "action": 0.7, "result": 0.7}
+SOURCE_KINDS = ("fact", "symbol")   # clean content lives here (code/docs ingested via markitdown etc.)
+
 # tokens too generic to be worth wiring an edge on
 _STOP = {"the", "a", "an", "is", "to", "of", "and", "or", "in", "on", "for", "it",
          "def", "return", "self", "if", "else", "not", "true", "false", "none"}
@@ -164,6 +171,10 @@ class Graph:
                     adj_rank.append(p)
 
         fused = rrf([r for r in (vec_rank, bm_rank, adj_rank) if r])
+        # gbrain SOURCE-TIER BOOST: multiply each fused score by its kind's authority, so
+        # code/docs (fact/symbol) outrank session chatter (directive/result) and chatter
+        # can't crowd out the real content (the duo2 retrieval bug).
+        fused = {i: s * TIER.get(self.nodes[i]["kind"], 1.0) for i, s in fused.items()}
         order = sorted(fused, key=lambda i: fused[i], reverse=True)
         hits = []
         for i in order:
@@ -177,6 +188,23 @@ class Graph:
             if len(hits) >= k:
                 break
         return hits
+
+    def retrieve_content(self, query, k=3, max_chars=4000):
+        """ON-DEMAND content retrieval (the scalable channel): return the CLEAN text of the
+        top SOURCE-tier nodes (code/docs) for `query` — no `[kind/author]` labels, no chatter.
+        This is what you feed a Reasoner for a BIG task instead of always-injecting the whole
+        repo: pull only the relevant code/doc chunks when it needs them."""
+        hits = self.search(query, k=k, kinds=SOURCE_KINDS)
+        out, used = [], 0
+        for h in hits:
+            t = h["text"]
+            if used + len(t) > max_chars:
+                t = t[:max_chars - used]
+            out.append(t)
+            used += len(t)
+            if used >= max_chars:
+                break
+        return "\n\n".join(out)
 
     def think(self, query, k=5):
         """gbrain `think`: synthesize a short answer from the top hits + a GAP note

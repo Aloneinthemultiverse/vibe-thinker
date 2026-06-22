@@ -121,6 +121,36 @@ def test_bad_kind_and_edge_rejected():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_source_tier_boost():
+    """gbrain source-tier: a code 'fact' node must outrank session chatter for the same
+    query, so chatter can't crowd out the real content (the duo2 retrieval bug)."""
+    g, tmp = _g()
+    try:
+        # lots of chatter mentioning 'initials', plus ONE real code fact
+        for i in range(5):
+            g.add_node("result", "actor", f"attempt {i}: initials still failing on case")
+            g.add_node("directive", "reasoner", f"round {i}: fix initials casing somehow")
+        g.add_node("fact", "system",
+                   "FILE buggy.py:\ndef initials(name):\n    return ''.join(w[0] for w in name.split()).upper()")
+        hits = g.search("initials function code", k=3)
+        assert hits[0]["kind"] == "fact", f"chatter crowded out code: top={hits[0]['kind']}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_retrieve_content_clean():
+    """retrieve_content returns CLEAN source text (no [kind/author] labels, no chatter)."""
+    g, tmp = _g()
+    try:
+        g.add_node("directive", "reasoner", "noise about initials we should ignore")
+        g.add_node("fact", "system", "def initials(name):\n    return 'AL'  # the code")
+        content = g.retrieve_content("initials code", k=2)
+        assert "def initials" in content
+        assert "[directive" not in content and "noise about" not in content
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0
