@@ -249,7 +249,7 @@ def _reasoner_file_content(task, fname):
            "Output ONLY the file's raw text/code. No explanation, no markdown fences.")
     try:
         r = llm.chat_reasoner([{"role": "system", "content": "You are an expert programmer."},
-                               {"role": "user", "content": usr}], temperature=0.2, max_tokens=1024)
+                               {"role": "user", "content": usr}], temperature=0.2, max_tokens=4096)
     except Exception:
         return ""
     # Strip a code fence if the model added one anyway.
@@ -299,9 +299,12 @@ def _generate(messages, tools=None):
         # stop before anything was accomplished. Require a non-error tool result.
         succeeded = any(m.get("role") == "tool"
                         and not _is_error_result(m.get("content")) for m in messages)
-        verdict, guidance, forced_tool = _reasoner_judge(messages, tools)
-        if verdict == "done" and succeeded:
-            return "Task complete."   # no tool call -> finish_reason stop -> harness stops
+        # Only spend a Reasoner call on completion judgment AFTER something has succeeded —
+        # before that, DONE can't fire anyway and deterministic routing handles the move.
+        if succeeded:
+            verdict, guidance, forced_tool = _reasoner_judge(messages, tools)
+            if verdict == "done":
+                return "Task complete."   # no tool call -> finish_reason stop -> harness stops
         # The 3B Reasoner is unreliable at routing (and may even say DONE on turn 1). For the
         # create-file case the right move is deterministic — override with it when available.
         det_tool, det_guidance = _deterministic_tool(messages, tools)
@@ -310,15 +313,18 @@ def _generate(messages, tools=None):
     sys_extra = ""
     grammar = None
     if tools:
-        tools = _relevant_tools(tools, _last_user(messages))   # TOOL-KG: only relevant tools
-        # THE COUPLE STEERS THE TOOL: if the Reasoner named a specific next tool, narrow the
-        # grammar to JUST that tool so v12 cannot pick the wrong one (e.g. read a file that
-        # must first be written). This is the Reasoner-directs / Actor-executes division.
-        grammar_tools = tools
+        full_tools = tools
+        # THE COUPLE STEERS THE TOOL: if a tool was forced, pick it from the FULL list FIRST —
+        # before TOOL-KG narrowing, which can rank the wrong tools higher and drop the one we
+        # need (e.g. drop `write` for a "build app" query, leaving only read -> wrong action).
+        grammar_tools = None
         if forced_tool:
-            picked = [t for t in tools if t.get("function", {}).get("name") == forced_tool]
+            picked = [t for t in full_tools if t.get("function", {}).get("name") == forced_tool]
             if picked:
                 grammar_tools = picked
+        if grammar_tools is None:
+            grammar_tools = _relevant_tools(full_tools, _last_user(messages))  # TOOL-KG top-k
+        tools = grammar_tools
         spec = []
         for t in grammar_tools:
             fn = t.get("function", {})
