@@ -37,3 +37,4 @@ Thumbs.db
 .vscode/
 .idea/
 eval/data/humaneval_results.jsonl
+eval/data/humaneval_results_couple.jsonl

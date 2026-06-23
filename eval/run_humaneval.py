@@ -24,7 +24,9 @@ from agent import llm
 DATA = os.path.join(os.path.dirname(__file__), "data", "HumanEval.jsonl.gz")
 
 
-RESULTS = os.path.join(os.path.dirname(__file__), "data", "humaneval_results.jsonl")
+def _results_path(couple):
+    name = "humaneval_results_couple.jsonl" if couple else "humaneval_results.jsonl"
+    return os.path.join(os.path.dirname(__file__), "data", name)
 
 
 def load(n):
@@ -32,11 +34,11 @@ def load(n):
     return rows if n is None else rows[:n]
 
 
-def _load_done():
+def _load_done(path):
     """Read already-graded results so a crashed run can resume. Returns {task_id: record}."""
     done = {}
-    if os.path.exists(RESULTS):
-        for line in open(RESULTS, "r", encoding="utf-8"):
+    if os.path.exists(path):
+        for line in open(path, "r", encoding="utf-8"):
             line = line.strip()
             if line:
                 r = json.loads(line)
@@ -44,8 +46,8 @@ def _load_done():
     return done
 
 
-def _append(rec):
-    with open(RESULTS, "a", encoding="utf-8") as f:
+def _append(path, rec):
+    with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
 
 
@@ -56,7 +58,8 @@ def extract_code(text):
     return (m.group(1) if m else text).strip()
 
 
-def generate(prompt, prior_fail=""):
+def _reason(prompt, prior_fail=""):
+    """Base VibeThinker-3B reasons toward the solution (raw, includes its CoT)."""
     usr = ("Complete this Python function. Return ONLY the full function definition (signature "
            "+ body), no explanation, no tests, no markdown.\n\n" + prompt)
     if prior_fail:
@@ -64,9 +67,28 @@ def generate(prompt, prior_fail=""):
                 + "\nReturn a corrected full function.")
     # VibeThinker is a long-CoT model -- it thinks for thousands of tokens before the code.
     # A small cap truncates it before any code is emitted, so give it room.
-    r = llm.chat_reasoner([{"role": "system", "content": "You are an expert Python programmer."},
-                           {"role": "user", "content": usr}], temperature=0.2, max_tokens=3584)
-    return extract_code(r)
+    return llm.chat_reasoner([{"role": "system", "content": "You are an expert Python programmer."},
+                              {"role": "user", "content": usr}], temperature=0.2, max_tokens=3584)
+
+
+def _transcribe_v12(reasoner_raw):
+    """THE COUPLE: v12 (Actor) transcribes the Reasoner's messy CoT into one clean function.
+    This is duo.py's proven division. On pure codegen it may add variance -- that's the
+    experiment. Falls back to the reasoner's own code if v12 returns nothing usable."""
+    usr = ("A reasoning model produced this solution attempt (it may include thinking). "
+           "Output ONLY the final, complete Python function definition it arrived at -- no "
+           "explanation, no tests, no markdown.\n\n" + reasoner_raw[-4000:])
+    out = llm.chat([{"role": "system", "content": "You extract the final clean code."},
+                    {"role": "user", "content": usr}], temperature=0.1, max_tokens=1536)
+    return extract_code(out)
+
+
+def generate(prompt, prior_fail="", couple=False):
+    raw = _reason(prompt, prior_fail)
+    if not couple:
+        return extract_code(raw)
+    code = _transcribe_v12(raw)
+    return code or extract_code(raw)   # fall back to reasoner code if v12 whiffs
 
 
 def _prompt_header(prompt, entry):
@@ -105,14 +127,14 @@ def run_test(code, test, entry, timeout=15, header=""):
             pass
 
 
-def solve_one(p, retry=True):
+def solve_one(p, retry=True, couple=False):
     header = _prompt_header(p["prompt"], p["entry_point"])
-    code = _ensure_signature(generate(p["prompt"]), p["prompt"], p["entry_point"])
+    code = _ensure_signature(generate(p["prompt"], couple=couple), p["prompt"], p["entry_point"])
     ok, err = run_test(code, p["test"], p["entry_point"], header=header)
     used_retry = False
     if not ok and retry:
         used_retry = True
-        code = _ensure_signature(generate(p["prompt"], prior_fail=err),
+        code = _ensure_signature(generate(p["prompt"], prior_fail=err, couple=couple),
                                  p["prompt"], p["entry_point"])
         ok, err = run_test(code, p["test"], p["entry_point"], header=header)
     return ok, used_retry
@@ -126,26 +148,31 @@ def main():
     else:
         n = int(args[0]) if args else 20
     retry = "--noretry" not in sys.argv
+    couple = "--couple" in sys.argv          # full Reasoner+v12 couple vs reasoner-only
+    path = _results_path(couple)
     probs = load(n)
-    done = _load_done()                       # resume: skip already-graded task_ids
+    done = _load_done(path)                   # resume: skip already-graded task_ids
+    print(f"MODE: {'FULL COUPLE (Reasoner+v12)' if couple else 'Reasoner+verify'} -> {os.path.basename(path)}")
     for i, p in enumerate(probs, 1):
         tid = p["task_id"]
         if tid in done:
             r = done[tid]
             print(f"[{i}/{len(probs)}] {tid:<14} {'PASS' if r['ok'] else 'FAIL'} (cached)", flush=True)
             continue
-        ok, used = solve_one(p, retry=retry)
-        _append({"task_id": tid, "ok": bool(ok), "used_retry": bool(used)})
+        ok, used = solve_one(p, retry=retry, couple=couple)
+        _append(path, {"task_id": tid, "ok": bool(ok), "used_retry": bool(used)})
         print(f"[{i}/{len(probs)}] {tid:<14} {'PASS' if ok else 'FAIL'}"
               f"{' (saved by retry)' if ok and used else ''}", flush=True)
     # Summarize over the problems in scope (from the checkpoint file).
-    done = _load_done()
+    done = _load_done(path)
     scope = [p["task_id"] for p in probs]
     recs = [done[t] for t in scope if t in done]
     passed = sum(r["ok"] for r in recs)
     saves = sum(r["ok"] and r["used_retry"] for r in recs)
+    single = passed - saves
     print(f"\n=== HumanEval pass@1: {passed}/{len(recs)} = {100*passed/max(1,len(recs)):.1f}% "
           f"({'with' if retry else 'NO'} verify-retry) ===")
+    print(f"single-shot (no retry): {single}/{len(recs)} = {100*single/max(1,len(recs)):.1f}%")
     if retry:
         print(f"verify-loop rescued {saves} that single-shot would have failed")
 
