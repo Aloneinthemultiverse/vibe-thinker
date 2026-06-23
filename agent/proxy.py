@@ -199,6 +199,65 @@ def build_response(content, model="couplevibe", created=0, tools=None):
 
 
 # --------------------------------------------------------------- live server (optional)
+_ERR_MARKERS = ("not found", "error", "failed", "no such file", "invalid", "missing key")
+
+
+def _is_error_result(content):
+    """True if a tool RESULT looks like a failure (so it shouldn't count as progress)."""
+    s = content if isinstance(content, str) else json.dumps(content or "")
+    s = s.lower()
+    return any(m in s for m in _ERR_MARKERS)
+
+
+def _target_files(text):
+    """Pull likely target filenames out of a task/message (e.g. calc.py, src/x.ts)."""
+    return re.findall(r"[\w./\\-]+\.[A-Za-z][A-Za-z0-9]{0,4}\b", text or "")
+
+
+def _deterministic_tool(messages, tools):
+    """Reliable next-tool hint that does NOT trust the 3B for routing. The 3B's failure on
+    create tasks is picking `read` on a file that doesn't exist; deterministically: if the
+    task names a file that has NOT been written/read successfully yet, the next step is to
+    WRITE it. Returns (tool_name, guidance) or ('', '')."""
+    names = _tool_names(tools)
+    write_tool = next((n for n in ("write", "create", "create_file", "edit") if n in names), None)
+    if not write_tool:
+        return "", ""
+    task = next((m.get("content") for m in messages if m.get("role") == "user"), "") or ""
+    targets = _target_files(task if isinstance(task, str) else json.dumps(task))
+    if not targets:
+        return "", ""
+    # Has any tool already SUCCEEDED (a non-error tool result)? If so, don't force write.
+    if any(m.get("role") == "tool" and not _is_error_result(m.get("content")) for m in messages):
+        return "", ""
+    fname = targets[0]
+    # COUPLE reason->transcribe: the Reasoner (strong coder) writes the actual file content;
+    # v12 just emits the write call carrying it. Fixes v12 writing prose instead of code.
+    code = _reasoner_file_content(task, fname)
+    if code:
+        return write_tool, (f"Use the {write_tool} tool to create {fname} with EXACTLY this "
+                            f"content (copy it verbatim, do not summarize):\n{code}")
+    return write_tool, (f"The file {fname} does not exist yet, so create it now with the "
+                        f"{write_tool} tool, writing the full required contents.")
+
+
+def _reasoner_file_content(task, fname):
+    """Ask the Reasoner to emit ONLY the raw file content (no prose, no fences) for a create
+    task. Returns the code string, or '' on failure (caller falls back to generic guidance)."""
+    from . import llm
+    usr = (f"Write the COMPLETE contents of the file `{fname}` for this task:\n{task}\n\n"
+           "Output ONLY the file's raw text/code. No explanation, no markdown fences.")
+    try:
+        r = llm.chat_reasoner([{"role": "system", "content": "You are an expert programmer."},
+                               {"role": "user", "content": usr}], temperature=0.2, max_tokens=1024)
+    except Exception:
+        return ""
+    # Strip a code fence if the model added one anyway.
+    fence = re.search(r"```[a-zA-Z]*\n(.*?)```", r, re.S)
+    code = fence.group(1) if fence else r
+    return code.strip()
+
+
 def _reasoner_judge(messages, tools):
     """THE COUPLE for a harness: the Reasoner (base 3B) looks at the task + recent tool
     results and decides DONE vs CONTINUE(+next action). Supplies the completion judgment v12
@@ -207,18 +266,25 @@ def _reasoner_judge(messages, tools):
     task = next((m.get("content") for m in messages if m.get("role") == "user"), "")
     convo = "\n".join(f"{m.get('role')}: {str(m.get('content'))[:280]}" for m in messages[-6:])
     names = ", ".join(t.get("function", {}).get("name", "") for t in (tools or []))
-    usr = (f"TASK: {task}\n\nRECENT ACTIVITY (newest last):\n{convo}\n\nTools: {names}\n\n"
-           "Is the TASK now fully complete? Reason briefly, then end with EXACTLY one line:\n"
-           "VERDICT: DONE\n  or\nVERDICT: CONTINUE - <the single next action in plain words>")
+    usr = (f"TASK: {task}\n\nRECENT ACTIVITY (newest last):\n{convo}\n\nAvailable tools: {names}\n\n"
+           "Decide the SINGLE next step. If a target file does not exist yet, it must be "
+           "CREATED with a write tool before it can be read. Reason briefly, then end with "
+           "EXACTLY two lines:\n"
+           "VERDICT: DONE        (only if the task is fully accomplished)\n"
+           "  or\nVERDICT: CONTINUE - <the single next action in plain words>\n"
+           "TOOL: <the exact name of the one tool to use next, from the list above>")
     try:
-        r = llm.chat_reasoner([{"role": "system", "content": "You judge agent task completion."},
+        r = llm.chat_reasoner([{"role": "system", "content": "You direct a coding agent's next move."},
                                {"role": "user", "content": usr}], temperature=0.3, max_tokens=1024)
     except Exception:
-        return "continue", ""
-    m = re.search(r"VERDICT:\s*(DONE|CONTINUE)\s*-?\s*(.*)", r, re.I | re.S)
+        return "continue", "", ""
+    valid = _tool_names(tools)
+    tm = re.search(r"TOOL:\s*([\w.\-]+)", r, re.I)
+    tool = tm.group(1) if tm and tm.group(1) in valid else ""
+    m = re.search(r"VERDICT:\s*(DONE|CONTINUE)\s*-?\s*([^\n]*)", r, re.I)
     if m and m.group(1).upper() == "DONE":
-        return "done", ""
-    return "continue", (m.group(2).strip()[:280] if m else "")
+        return "done", "", ""
+    return "continue", (m.group(2).strip()[:280] if m else ""), tool
 
 
 def _generate(messages, tools=None):
@@ -226,19 +292,35 @@ def _generate(messages, tools=None):
     then v12 acts on that guidance. Default (off) = proven v12-only path."""
     from . import llm
     guidance = ""
+    forced_tool = ""
     if os.environ.get("DUO_COUPLE") and tools and llm.reasoner_healthy():
-        # Only judge completion AFTER at least one tool has run — otherwise the Reasoner can
-        # wrongly declare "done" on turn 1 before anything happens.
-        acted = any(m.get("role") == "tool" or m.get("tool_calls") for m in messages)
-        verdict, guidance = _reasoner_judge(messages, tools)
-        if verdict == "done" and acted:
+        # Only declare done after a tool actually SUCCEEDED — a failed read (file-not-found)
+        # is still a role==tool message, so counting any tool call lets the Reasoner wrongly
+        # stop before anything was accomplished. Require a non-error tool result.
+        succeeded = any(m.get("role") == "tool"
+                        and not _is_error_result(m.get("content")) for m in messages)
+        verdict, guidance, forced_tool = _reasoner_judge(messages, tools)
+        if verdict == "done" and succeeded:
             return "Task complete."   # no tool call -> finish_reason stop -> harness stops
+        # The 3B Reasoner is unreliable at routing (and may even say DONE on turn 1). For the
+        # create-file case the right move is deterministic — override with it when available.
+        det_tool, det_guidance = _deterministic_tool(messages, tools)
+        if det_tool:
+            forced_tool, guidance = det_tool, det_guidance
     sys_extra = ""
     grammar = None
     if tools:
         tools = _relevant_tools(tools, _last_user(messages))   # TOOL-KG: only relevant tools
+        # THE COUPLE STEERS THE TOOL: if the Reasoner named a specific next tool, narrow the
+        # grammar to JUST that tool so v12 cannot pick the wrong one (e.g. read a file that
+        # must first be written). This is the Reasoner-directs / Actor-executes division.
+        grammar_tools = tools
+        if forced_tool:
+            picked = [t for t in tools if t.get("function", {}).get("name") == forced_tool]
+            if picked:
+                grammar_tools = picked
         spec = []
-        for t in tools:
+        for t in grammar_tools:
             fn = t.get("function", {})
             params = fn.get("parameters", {}) or {}
             req = params.get("required") or list((params.get("properties") or {}).keys())
@@ -247,10 +329,10 @@ def _generate(messages, tools=None):
                      '{"name": "<tool>", "arguments": {<exact arg keys>}}\n'
                      "Use EXACTLY these argument keys for each tool:\n" + "\n".join(spec))
         # GRAMMAR CONSTRAINT (default on; DUO_GRAMMAR=0 to disable): force the decoder to a
-        # legal tool call so v12 cannot emit a filename as the tool name. This is the fix
-        # for the OpenCode 3B ceiling — structure is enforced, not just requested.
+        # legal tool call so v12 cannot emit a filename as the tool name. When the Reasoner
+        # picked a tool, this grammar admits only that one — structure AND choice enforced.
         if os.environ.get("DUO_GRAMMAR", "1") != "0":
-            grammar = tool_grammar(tools)
+            grammar = tool_grammar(grammar_tools)
     if guidance:
         sys_extra += f"\n\nThe reasoner advises the next action: {guidance}"
     msgs = list(messages)
