@@ -68,9 +68,68 @@ def extract_tool_calls(content):
     return calls, text.strip()
 
 
-def build_response(content, model="couplevibe", created=0):
+# Common alias mismatches between our fine-tune schema and harness tool schemas.
+_ARG_ALIASES = {"path": "filePath", "file": "filePath", "filepath": "filePath",
+                "file_path": "filePath", "text": "content", "code": "content"}
+
+
+def _relevant_tools(tools, query, k=6):
+    """TOOL-KG retrieval: instead of injecting ALL tool schemas into v12 (~10k tokens),
+    retrieve only the top-k tools relevant to the task. Cuts tokens drastically AND helps the
+    3B pick better (fewer tools = less wandering). Built on our own VecIndex (no GPL)."""
+    if not tools or len(tools) <= k:
+        return tools
+    from .vecindex import VecIndex, default_embedder
+    vi = VecIndex(embedder=default_embedder())
+    for t in tools:
+        fn = t.get("function", {})
+        props = (fn.get("parameters", {}) or {}).get("properties", {}) or {}
+        vi.add(f"{fn.get('name','')} {fn.get('description','')} {' '.join(props)}")
+    rank, _ = vi.vector_rank(query, limit=k)
+    return [tools[i] for i in rank[:k]] or tools
+
+
+def _last_user(messages):
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            c = m.get("content")
+            return c if isinstance(c, str) else json.dumps(c)
+    return ""
+
+
+def _required_keys(tools, name):
+    for t in tools or []:
+        fn = t.get("function", {})
+        if fn.get("name") == name:
+            params = fn.get("parameters", {}) or {}
+            return params.get("required") or list((params.get("properties") or {}).keys())
+    return None
+
+
+def _remap_args(name, args, tools):
+    """Rename v12's arg keys to the target tool's actual schema when they're obvious
+    aliases (path->filePath). Only fills keys the tool wants that are missing."""
+    req = _required_keys(tools, name)
+    if not req or not isinstance(args, dict):
+        return args
+    out = dict(args)
+    for k in list(out.keys()):
+        if k not in req and _ARG_ALIASES.get(k) in req and _ARG_ALIASES[k] not in out:
+            out[_ARG_ALIASES[k]] = out.pop(k)
+    return out
+
+
+def build_response(content, model="couplevibe", created=0, tools=None):
     """Wrap (possibly tool-calling) text into an OpenAI chat-completion response."""
     calls, leftover = extract_tool_calls(content)
+    if tools:
+        for c in calls:
+            fn = c["function"]
+            try:
+                args = json.loads(fn["arguments"])
+            except Exception:
+                args = {}
+            fn["arguments"] = json.dumps(_remap_args(fn["name"], args, tools))
     message = {"role": "assistant", "content": leftover or (None if calls else content)}
     if calls:
         message["tool_calls"] = calls
@@ -92,9 +151,16 @@ def _generate(messages, tools=None):
     # have v12 emit the concrete call. (Kept simple; the adapter does the format work.)
     sys_extra = ""
     if tools:
-        names = ", ".join(t.get("function", {}).get("name", "") for t in tools)
-        sys_extra = (f"\nAvailable tools: {names}. To act, output exactly one JSON object: "
-                     '{"name": "<tool>", "arguments": {...}}.')
+        tools = _relevant_tools(tools, _last_user(messages))   # TOOL-KG: only relevant tools
+        spec = []
+        for t in tools:
+            fn = t.get("function", {})
+            params = fn.get("parameters", {}) or {}
+            req = params.get("required") or list((params.get("properties") or {}).keys())
+            spec.append(f'  {fn.get("name","")}(args: {", ".join(req) or "none"})')
+        sys_extra = ("\nTo use a tool, output EXACTLY one JSON object and nothing else:\n"
+                     '{"name": "<tool>", "arguments": {<exact arg keys>}}\n'
+                     "Use EXACTLY these argument keys for each tool:\n" + "\n".join(spec))
     msgs = list(messages)
     if sys_extra:
         msgs = [{"role": "system", "content": sys_extra}] + msgs
@@ -149,8 +215,9 @@ def serve(port=8088):  # pragma: no cover - manual/integration use
             body = json.loads(self.rfile.read(n) or b"{}")
             model = body.get("model", "couplevibe")
             try:
-                raw = _generate(body.get("messages", []), body.get("tools"))
-                resp = build_response(raw, model=model)
+                tools = body.get("tools")
+                raw = _generate(body.get("messages", []), tools)
+                resp = build_response(raw, model=model, tools=tools)
             except Exception as e:
                 resp = build_response(f"error: {e}", model=model)
             if body.get("stream"):
