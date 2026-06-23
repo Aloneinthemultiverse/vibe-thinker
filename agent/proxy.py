@@ -15,9 +15,11 @@ import json
 import re
 import time
 
-# Match a JSON object that looks like a tool call: {"name": "...", "arguments": {...}}
-_CALL = re.compile(r'\{[^{}]*"name"\s*:\s*"(?P<name>\w+)"[^{}]*"arguments"\s*:\s*(?P<args>\{[^{}]*\})[^{}]*\}',
-                   re.DOTALL)
+# Match a JSON tool-call object. v12 is INCONSISTENT — it uses "name" OR "tool" as the key,
+# tool names can be hyphenated (e.g. gitnexus-debugging), and args under "arguments" OR "args".
+_CALL = re.compile(
+    r'\{[^{}]*"(?:name|tool)"\s*:\s*"[\w.\-]+"[^{}]*"(?:arguments|args)"\s*:\s*\{[^{}]*\}[^{}]*\}',
+    re.DOTALL)
 # Also accept OpenAI-ish "parameters" / function wrappers and fenced json blocks.
 _FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
@@ -99,6 +101,29 @@ def _generate(messages, tools=None):
     return llm.chat(msgs, temperature=0.2, max_tokens=1024)
 
 
+def _sse_chunks(resp, model):
+    """Turn a finished response into OpenAI streaming SSE chunks (role -> body -> finish -> DONE).
+    We generate non-streaming under the hood, then replay as a few SSE deltas, which the Vercel
+    AI SDK (OpenCode) accepts."""
+    msg = resp["choices"][0]["message"]
+    finish = resp["choices"][0]["finish_reason"]
+    base = {"id": resp["id"], "object": "chat.completion.chunk", "model": model}
+
+    def chunk(delta, fr=None):
+        return "data: " + json.dumps({**base, "choices": [
+            {"index": 0, "delta": delta, "finish_reason": fr}]}) + "\n\n"
+
+    yield chunk({"role": "assistant"})
+    if msg.get("tool_calls"):
+        for i, tc in enumerate(msg["tool_calls"]):
+            yield chunk({"tool_calls": [{"index": i, "id": tc["id"], "type": "function",
+                                         "function": tc["function"]}]})
+    elif msg.get("content"):
+        yield chunk({"content": msg["content"]})
+    yield chunk({}, fr=finish)
+    yield "data: [DONE]\n\n"
+
+
 def serve(port=8088):  # pragma: no cover - manual/integration use
     """Start the OpenAI-compatible endpoint. Point OpenCode/aider at http://127.0.0.1:8088/v1."""
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -107,22 +132,44 @@ def serve(port=8088):  # pragma: no cover - manual/integration use
         def log_message(self, *a):
             pass
 
+        def do_GET(self):
+            if self.path.rstrip("/").endswith("/models"):
+                body = json.dumps({"object": "list", "data": [
+                    {"id": "couplevibe", "object": "model", "owned_by": "couplevibe"}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404); self.end_headers()
+
         def do_POST(self):
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or b"{}")
+            model = body.get("model", "couplevibe")
             try:
                 raw = _generate(body.get("messages", []), body.get("tools"))
-                resp = build_response(raw, model=body.get("model", "couplevibe"))
+                resp = build_response(raw, model=model)
             except Exception as e:
-                resp = build_response(f"error: {e}")
-            data = json.dumps(resp).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+                resp = build_response(f"error: {e}", model=model)
+            if body.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                for c in _sse_chunks(resp, model):
+                    self.wfile.write(c.encode())
+                    self.wfile.flush()
+            else:
+                data = json.dumps(resp).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
 
-    print(f"CoupleVibe proxy on http://127.0.0.1:{port}/v1/chat/completions")
+    print(f"CoupleVibe proxy on http://127.0.0.1:{port}/v1  (chat/completions + models)")
     HTTPServer(("127.0.0.1", port), H).serve_forever()
 
 

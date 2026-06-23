@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "couplevibe": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "CoupleVibe LLM",
+      "options": {
+        "baseURL": "http://127.0.0.1:8088/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "couplevibe": {
+          "name": "CoupleVibe LLM (2x3B coupled)",
+          "tools": true
+        }
+      }
+    }
+  }
+}
