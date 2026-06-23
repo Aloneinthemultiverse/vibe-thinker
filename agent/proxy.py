@@ -12,6 +12,7 @@ The translation (extract_tool_calls) is the critical piece and is a pure, unit-t
 function — no server, no model needed to validate it.
 """
 import json
+import os
 import re
 import time
 
@@ -144,11 +145,40 @@ def build_response(content, model="couplevibe", created=0, tools=None):
 
 
 # --------------------------------------------------------------- live server (optional)
-def _generate(messages, tools=None):
-    """Reasoner THINKS, Actor EMITS. Returns the Actor's raw text (to be translated)."""
+def _reasoner_judge(messages, tools):
+    """THE COUPLE for a harness: the Reasoner (base 3B) looks at the task + recent tool
+    results and decides DONE vs CONTINUE(+next action). Supplies the completion judgment v12
+    lacks (it loops forever otherwise) and guides the next action."""
     from . import llm
-    # If a harness is driving with tools, let the base Reasoner add a brief plan first, then
-    # have v12 emit the concrete call. (Kept simple; the adapter does the format work.)
+    task = next((m.get("content") for m in messages if m.get("role") == "user"), "")
+    convo = "\n".join(f"{m.get('role')}: {str(m.get('content'))[:280]}" for m in messages[-6:])
+    names = ", ".join(t.get("function", {}).get("name", "") for t in (tools or []))
+    usr = (f"TASK: {task}\n\nRECENT ACTIVITY (newest last):\n{convo}\n\nTools: {names}\n\n"
+           "Is the TASK now fully complete? Reason briefly, then end with EXACTLY one line:\n"
+           "VERDICT: DONE\n  or\nVERDICT: CONTINUE - <the single next action in plain words>")
+    try:
+        r = llm.chat_reasoner([{"role": "system", "content": "You judge agent task completion."},
+                               {"role": "user", "content": usr}], temperature=0.3, max_tokens=1024)
+    except Exception:
+        return "continue", ""
+    m = re.search(r"VERDICT:\s*(DONE|CONTINUE)\s*-?\s*(.*)", r, re.I | re.S)
+    if m and m.group(1).upper() == "DONE":
+        return "done", ""
+    return "continue", (m.group(2).strip()[:280] if m else "")
+
+
+def _generate(messages, tools=None):
+    """Reasoner THINKS, Actor EMITS. DUO_COUPLE=1 = the couple: Reasoner judges DONE/next,
+    then v12 acts on that guidance. Default (off) = proven v12-only path."""
+    from . import llm
+    guidance = ""
+    if os.environ.get("DUO_COUPLE") and tools and llm.reasoner_healthy():
+        # Only judge completion AFTER at least one tool has run — otherwise the Reasoner can
+        # wrongly declare "done" on turn 1 before anything happens.
+        acted = any(m.get("role") == "tool" or m.get("tool_calls") for m in messages)
+        verdict, guidance = _reasoner_judge(messages, tools)
+        if verdict == "done" and acted:
+            return "Task complete."   # no tool call -> finish_reason stop -> harness stops
     sys_extra = ""
     if tools:
         tools = _relevant_tools(tools, _last_user(messages))   # TOOL-KG: only relevant tools
@@ -161,6 +191,8 @@ def _generate(messages, tools=None):
         sys_extra = ("\nTo use a tool, output EXACTLY one JSON object and nothing else:\n"
                      '{"name": "<tool>", "arguments": {<exact arg keys>}}\n'
                      "Use EXACTLY these argument keys for each tool:\n" + "\n".join(spec))
+    if guidance:
+        sys_extra += f"\n\nThe reasoner advises the next action: {guidance}"
     msgs = list(messages)
     if sys_extra:
         msgs = [{"role": "system", "content": sys_extra}] + msgs
