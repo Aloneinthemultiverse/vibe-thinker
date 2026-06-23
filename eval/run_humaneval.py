@@ -24,9 +24,29 @@ from agent import llm
 DATA = os.path.join(os.path.dirname(__file__), "data", "HumanEval.jsonl.gz")
 
 
+RESULTS = os.path.join(os.path.dirname(__file__), "data", "humaneval_results.jsonl")
+
+
 def load(n):
     rows = [json.loads(l) for l in gzip.open(DATA, "rt", encoding="utf-8")]
-    return rows[:n]
+    return rows if n is None else rows[:n]
+
+
+def _load_done():
+    """Read already-graded results so a crashed run can resume. Returns {task_id: record}."""
+    done = {}
+    if os.path.exists(RESULTS):
+        for line in open(RESULTS, "r", encoding="utf-8"):
+            line = line.strip()
+            if line:
+                r = json.loads(line)
+                done[r["task_id"]] = r
+    return done
+
+
+def _append(rec):
+    with open(RESULTS, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
 
 
 def extract_code(text):
@@ -100,20 +120,34 @@ def solve_one(p, retry=True):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    n = int(args[0]) if args else 20
+    # `all` or omitted-with-many -> full 164. A number -> first N.
+    if args and args[0].lower() in ("all", "full", "164"):
+        n = None
+    else:
+        n = int(args[0]) if args else 20
     retry = "--noretry" not in sys.argv
     probs = load(n)
-    passed = retry_saves = 0
+    done = _load_done()                       # resume: skip already-graded task_ids
     for i, p in enumerate(probs, 1):
+        tid = p["task_id"]
+        if tid in done:
+            r = done[tid]
+            print(f"[{i}/{len(probs)}] {tid:<14} {'PASS' if r['ok'] else 'FAIL'} (cached)", flush=True)
+            continue
         ok, used = solve_one(p, retry=retry)
-        passed += ok
-        retry_saves += (ok and used)
-        print(f"[{i}/{len(probs)}] {p['task_id']:<14} {'PASS' if ok else 'FAIL'}"
+        _append({"task_id": tid, "ok": bool(ok), "used_retry": bool(used)})
+        print(f"[{i}/{len(probs)}] {tid:<14} {'PASS' if ok else 'FAIL'}"
               f"{' (saved by retry)' if ok and used else ''}", flush=True)
-    print(f"\n=== HumanEval pass@1: {passed}/{len(probs)} = {100*passed/len(probs):.1f}% "
+    # Summarize over the problems in scope (from the checkpoint file).
+    done = _load_done()
+    scope = [p["task_id"] for p in probs]
+    recs = [done[t] for t in scope if t in done]
+    passed = sum(r["ok"] for r in recs)
+    saves = sum(r["ok"] and r["used_retry"] for r in recs)
+    print(f"\n=== HumanEval pass@1: {passed}/{len(recs)} = {100*passed/max(1,len(recs)):.1f}% "
           f"({'with' if retry else 'NO'} verify-retry) ===")
     if retry:
-        print(f"verify-loop rescued {retry_saves} that single-shot would have failed")
+        print(f"verify-loop rescued {saves} that single-shot would have failed")
 
 
 if __name__ == "__main__":
