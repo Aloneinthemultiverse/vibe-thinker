@@ -74,6 +74,57 @@ _ARG_ALIASES = {"path": "filePath", "file": "filePath", "filepath": "filePath",
                 "file_path": "filePath", "text": "content", "code": "content"}
 
 
+def _tool_names(tools):
+    return [t.get("function", {}).get("name", "") for t in (tools or [])
+            if t.get("function", {}).get("name")]
+
+
+def _gbnf_str(s):
+    """Escape a literal string for a GBNF double-quoted terminal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def tool_grammar(tools):
+    """Build a GBNF grammar that forces the model to emit EXACTLY one JSON tool call
+    whose `name` is one of the REAL available tools. This makes the 3B's worst failure
+    mode — emitting a filename (calc.py) as the tool name — structurally impossible.
+    `arguments` stays a free JSON object. Returns None if there are no named tools."""
+    names = _tool_names(tools)
+    if not names:
+        return None
+    name_alt = " | ".join(f'"\\"{_gbnf_str(n)}\\""' for n in names)
+    return (
+        'root    ::= "{" ws "\\"name\\"" ws ":" ws name ws "," ws '
+        '"\\"arguments\\"" ws ":" ws object ws "}"\n'
+        f"name    ::= {name_alt}\n"
+        'object  ::= "{" ws ( pair ( ws "," ws pair )* )? ws "}"\n'
+        'pair    ::= string ws ":" ws value\n'
+        'value   ::= object | array | string | number | "true" | "false" | "null"\n'
+        'array   ::= "[" ws ( value ( ws "," ws value )* )? ws "]"\n'
+        'string  ::= "\\"" ( [^"\\\\] | "\\\\" . )* "\\""\n'
+        'number  ::= "-"? [0-9]+ ( "." [0-9]+ )? ( [eE] [-+]? [0-9]+ )?\n'
+        'ws      ::= [ \\t\\n]*\n'
+    )
+
+
+def _repair_name(name, args, tools):
+    """Safety net for when grammar is off/unsupported and v12 emits a bad tool name.
+    The signature failure is filename-as-toolname (name='calc.py') with the file body in
+    args — remap to the harness write tool, moving the filename into the path arg."""
+    names = _tool_names(tools)
+    if not names or name in names:
+        return name, args
+    looks_like_file = bool(re.search(r"\.[A-Za-z0-9]{1,5}$", name)) or "/" in name or "\\" in name
+    write_tool = next((n for n in ("write", "edit", "create", "create_file") if n in names), None)
+    if looks_like_file and write_tool and isinstance(args, dict):
+        out = dict(args)
+        out.setdefault("filePath", name)
+        return write_tool, out
+    # Otherwise snap to a case-insensitive match if one exists; else leave as-is.
+    low = {n.lower(): n for n in names}
+    return low.get(name.lower(), name), args
+
+
 def _relevant_tools(tools, query, k=6):
     """TOOL-KG retrieval: instead of injecting ALL tool schemas into v12 (~10k tokens),
     retrieve only the top-k tools relevant to the task. Cuts tokens drastically AND helps the
@@ -130,6 +181,9 @@ def build_response(content, model="couplevibe", created=0, tools=None):
                 args = json.loads(fn["arguments"])
             except Exception:
                 args = {}
+            # Repair a bad/invalid tool name (e.g. filename-as-toolname) BEFORE arg remap,
+            # so the harness only ever sees a real tool with the right schema keys.
+            fn["name"], args = _repair_name(fn["name"], args, tools)
             fn["arguments"] = json.dumps(_remap_args(fn["name"], args, tools))
     message = {"role": "assistant", "content": leftover or (None if calls else content)}
     if calls:
@@ -180,6 +234,7 @@ def _generate(messages, tools=None):
         if verdict == "done" and acted:
             return "Task complete."   # no tool call -> finish_reason stop -> harness stops
     sys_extra = ""
+    grammar = None
     if tools:
         tools = _relevant_tools(tools, _last_user(messages))   # TOOL-KG: only relevant tools
         spec = []
@@ -191,12 +246,17 @@ def _generate(messages, tools=None):
         sys_extra = ("\nTo use a tool, output EXACTLY one JSON object and nothing else:\n"
                      '{"name": "<tool>", "arguments": {<exact arg keys>}}\n'
                      "Use EXACTLY these argument keys for each tool:\n" + "\n".join(spec))
+        # GRAMMAR CONSTRAINT (default on; DUO_GRAMMAR=0 to disable): force the decoder to a
+        # legal tool call so v12 cannot emit a filename as the tool name. This is the fix
+        # for the OpenCode 3B ceiling — structure is enforced, not just requested.
+        if os.environ.get("DUO_GRAMMAR", "1") != "0":
+            grammar = tool_grammar(tools)
     if guidance:
         sys_extra += f"\n\nThe reasoner advises the next action: {guidance}"
     msgs = list(messages)
     if sys_extra:
         msgs = [{"role": "system", "content": sys_extra}] + msgs
-    return llm.chat(msgs, temperature=0.2, max_tokens=1024)
+    return llm.chat(msgs, temperature=0.2, max_tokens=1024, grammar=grammar)
 
 
 def _sse_chunks(resp, model):

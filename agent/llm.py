@@ -37,24 +37,30 @@ def _trim(messages, keep_tail=8):
     return head + tail
 
 
-def _body(messages, temperature, top_p, max_tokens):
-    return json.dumps({
+def _body(messages, temperature, top_p, max_tokens, grammar=None):
+    payload = {
         "messages": messages, "temperature": temperature, "top_p": top_p,
         "max_tokens": max_tokens, "stream": False,
-    }).encode("utf-8")
+    }
+    # GBNF grammar (llama-server) constrains the decoder to a legal output shape — used by
+    # the proxy to force v12 to emit a tool call whose `name` is a REAL tool (no more
+    # filename-as-toolname). Ignored by servers that don't support it.
+    if grammar:
+        payload["grammar"] = grammar
+    return json.dumps(payload).encode("utf-8")
 
 
-def chat(messages, temperature=0.6, top_p=0.95, max_tokens=2048):
+def chat(messages, temperature=0.6, top_p=0.95, max_tokens=2048, grammar=None):
     hdr = {"Content-Type": "application/json"}
     try:
-        return _post(ENDPOINT, _body(messages, temperature, top_p, max_tokens),
+        return _post(ENDPOINT, _body(messages, temperature, top_p, max_tokens, grammar),
                      hdr, timeout=300)
     except urllib.error.HTTPError as e:
         # 400 on a long conversation = prompt exceeded n_ctx. Retry once on a trimmed
         # history (keep the task + recent turns) instead of dying the whole run.
         if e.code == 400 and len(messages) > 10:
             trimmed = _trim(messages)
-            return _post(ENDPOINT, _body(trimmed, temperature, top_p, max_tokens),
+            return _post(ENDPOINT, _body(trimmed, temperature, top_p, max_tokens, grammar),
                          hdr, timeout=300)
         raise
 
