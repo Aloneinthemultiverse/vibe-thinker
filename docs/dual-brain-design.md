@@ -1,4 +1,5 @@
-# VibeThinker-OS — Dual-Brain (Coupled) Architecture
+# CoupleVibe LLM — Dual-Brain (Coupled) Architecture
+> Formerly "VibeThinker-OS". Branded **CoupleVibe LLM** — two coupled 3B brains (Reasoner + Actor).
 
 **Status:** DESIGN (not built). Author handoff doc. 2026-06-22.
 **One line:** Two VibeThinker models — a *Reasoner* and an *Actor* — coupled through a

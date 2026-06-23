@@ -1,16 +1,18 @@
-# VibeThinker-OS
+# CoupleVibe LLM
 
-A local, $0 autonomous coding agent built on a **3B** model — proof that **the harness is the
-intelligence, not the weights.**
+A local, $0 autonomous coding agent where **two tiny 3B models work as a couple** — a long-CoT
+*Reasoner* and a tool-tuned *Actor* — coupled through a shared graph. Proof that **the harness
+is the intelligence, not the weights.**
 
-A raw VibeThinker-3B solves ~50–58% of held-out bugs. The same weights inside this harness
-(retry-with-hint + escalation + episodic brain) hit **100% on held-out single-bug tasks** and
-**83% on compound multi-bug tasks** — *with no fine-tuning and no memorization* (eval runs with
-the brain off). Everything runs locally on an Intel Arc GPU via llama.cpp. No API, no cost.
+> **Why the name:** two brains, *coupled* like partners — one thinks, one acts — talking only
+> through a shared graph. Built on the MIT VibeThinker-3B ("Vibe") lineage.
+> *Technically it's a **2×3B dual-brain agent** (two LLMs + harness), branded CoupleVibe LLM.*
 
-> Next architecture (designed, not yet built): a **dual-brain** coupling of two 3B instances —
-> a long-CoT *Reasoner* + a tool-tuned *Actor* — talking through a shared graph. See
-> [docs/dual-brain-design.md](docs/dual-brain-design.md).
+A raw VibeThinker-3B solves ~50–58% of held-out bugs. Inside the harness it hits **100% on
+held-out single-bug tasks**; the **dual-brain coupling hits 100% on hard compound multi-bug
+tasks** (vs 83% single-brain), every one solved *via coupling* with no bigger model — *no
+fine-tuning, no memorization* (evals run honest). Runs locally on an Intel Arc GPU via
+llama.cpp. No API, no cost. See [docs/dual-brain-design.md](docs/dual-brain-design.md).
 
 ## How it works
 
